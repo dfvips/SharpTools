@@ -84,7 +84,7 @@ public class RobustDownloader
         var socketsHandler = new SocketsHttpHandler
         {
             PooledConnectionLifetime = TimeSpan.FromMinutes(2),
-            MaxConnectionsPerServer = threadCount + 2
+            MaxConnectionsPerServer = threadCount + 10 // 稍微增加一点冗余连接数，防止重启瞬间耗尽
         };
         var httpClient = new HttpClient(socketsHandler) { Timeout = TimeSpan.FromHours(24) };
         // 设置默认 User-Agent
@@ -93,7 +93,7 @@ public class RobustDownloader
         try
         {
             Console.Clear();
-            PrintColor("=== Robust Downloader v4.0 (Watchdog Enabled) ===", ConsoleColor.Cyan);
+            PrintColor("=== Robust Downloader v4.5 (Fixed Logic) ===", ConsoleColor.Cyan);
             Console.WriteLine($"URL: {url}");
             Console.WriteLine($"Out: {_savePath}\n");
 
@@ -117,7 +117,7 @@ public class RobustDownloader
             LoadResumeOffset();
             PrepareDiskSpace();
 
-            var chunks = GenerateChunks();
+            // 移除这里原来的 GenerateChunks，改为在 Manager 内部动态生成，防止重启时逻辑不一致
             long remainingBytes = _totalFileSize - _nextWriteOffset;
 
             // 初始化网络计数
@@ -132,7 +132,7 @@ public class RobustDownloader
             _globalStopwatch = Stopwatch.StartNew();
 
             // 初始化下载管理器
-            _downloadManager = new DownloadManager(url, chunks, threadCount);
+            _downloadManager = new DownloadManager(url, threadCount);
 
             var writerTask = Task.Run(WriterLoop);
 
@@ -237,21 +237,26 @@ public class RobustDownloader
         return supportsRange;
     }
 
-    private static async Task DownloadChunkWithRetry(HttpClient client, string url, Chunk chunk)
+    // 修改：增加了 CancellationToken 参数
+    private static async Task DownloadChunkWithRetry(HttpClient client, string url, Chunk chunk, CancellationToken token)
     {
         int retry = 0;
         while (retry < MAX_RETRIES)
         {
+            // 如果已经被取消，直接抛出，不要再尝试重连
+            token.ThrowIfCancellationRequested();
+
             try
             {
                 var request = new HttpRequestMessage(HttpMethod.Get, url);
                 request.Headers.Range = new System.Net.Http.Headers.RangeHeaderValue(chunk.Start, chunk.End);
 
-                using var response = await client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead);
+                // 重点：将 Token 传递给 SendAsync，这样软重启时能立即断开连接
+                using var response = await client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, token);
                 if (response.StatusCode != HttpStatusCode.PartialContent) 
                     throw new Exception($"Invalid Status Code: {response.StatusCode}");
 
-                using var stream = await response.Content.ReadAsStreamAsync();
+                using var stream = await response.Content.ReadAsStreamAsync(token);
                 
                 long expectedSize = chunk.End - chunk.Start + 1;
                 byte[] data = new byte[expectedSize];
@@ -259,7 +264,8 @@ public class RobustDownloader
                 int totalRead = 0;
                 while (totalRead < expectedSize)
                 {
-                    int read = await stream.ReadAsync(data, totalRead, (int)(expectedSize - totalRead));
+                    // 重点：将 Token 传递给 ReadAsync
+                    int read = await stream.ReadAsync(data, totalRead, (int)(expectedSize - totalRead), token);
                     if (read == 0) break;
                     totalRead += read;
                     Interlocked.Add(ref _totalNetworkBytes, read);
@@ -268,19 +274,24 @@ public class RobustDownloader
                 if (totalRead != expectedSize) throw new IOException("Stream ended early");
 
                 if (!_buffer.TryAdd(chunk.Start, data)) { }
-                return;
+                return; // 成功下载并加入 Buffer
+            }
+            catch (OperationCanceledException)
+            {
+                throw; // 向上抛出取消异常
             }
             catch (Exception)
             {
                 retry++;
                 if (retry >= MAX_RETRIES) throw; 
-                await Task.Delay(Math.Min(5000, 1000 * retry));
+                try { await Task.Delay(Math.Min(5000, 1000 * retry), token); } catch { }
             }
         }
     }
 
     private static void WriterLoop()
     {
+        // 保持原来的逻辑：顺序写入，这对机械硬盘至关重要
         using var fs = new FileStream(_downloadingPath, FileMode.Open, FileAccess.Write, FileShare.Read);
         fs.Seek(_nextWriteOffset, SeekOrigin.Begin);
 
@@ -296,7 +307,10 @@ public class RobustDownloader
                 _totalBytesWritten += data.Length;
                 unflushedBytes += data.Length;
 
+                // 移除已写入的块
                 _buffer.TryRemove(_nextWriteOffset - data.Length, out _);
+                
+                // 重点：Writer 负责释放“成功消费”的 Buffer 配额
                 _bufferSlots.Release();
 
                 if (unflushedBytes >= FLUSH_THRESHOLD || _totalBytesWritten == _totalFileSize)
@@ -308,7 +322,7 @@ public class RobustDownloader
             }
             else
             {
-                Thread.Sleep(20);
+                Thread.Sleep(20); // 机械硬盘不建议轮询太快
             }
         }
         fs.Flush(true);
@@ -337,8 +351,12 @@ public class RobustDownloader
                     Console.WriteLine();
                     PrintColor($"\n⚠️  STALL DETECTED! Download speed has been 0 for {STALL_TIMEOUT_MINUTES} minutes.", ConsoleColor.Red);
                     PrintColor("🔄 Restarting downloader automatically...", ConsoleColor.Yellow);
+                    
+                    // 触发软重启
                     _downloadManager.SoftRestart();
-                    lastActivityTime = DateTime.Now; // 重置
+                    
+                    // 稍微重置一下时间，避免连续触发
+                    lastActivityTime = DateTime.Now; 
                 }
             }
 
@@ -350,6 +368,7 @@ public class RobustDownloader
 
     private static async Task SingleThreadDownload(HttpClient client, string url)
     {
+        // 单线程模式逻辑保持不变
         using var response = await client.GetAsync(url, HttpCompletionOption.ResponseHeadersRead);
         using var stream = await response.Content.ReadAsStreamAsync();
         using var fs = new FileStream(_downloadingPath, FileMode.Create, FileAccess.Write, FileShare.Read);
@@ -413,17 +432,26 @@ public class RobustDownloader
         lock (_configLock) File.WriteAllText(_configPath, offset.ToString());
     }
 
-    private static List<Chunk> GenerateChunks()
+    // 辅助方法：生成需要下载的块（在 Manager 内部调用）
+    private static ConcurrentQueue<Chunk> GenerateChunksQueue(long startOffset)
     {
-        var list = new List<Chunk>();
-        long current = _nextWriteOffset;
+        var queue = new ConcurrentQueue<Chunk>();
+        long current = startOffset;
+        
+        // 我们需要跳过已经在内存 Buffer 中但还没写入磁盘的块
+        // 防止重复下载导致浪费带宽
+        var existingKeys = new HashSet<long>(_buffer.Keys);
+
         while (current < _totalFileSize)
         {
-            long end = Math.Min(current + _blockSizeBytes - 1, _totalFileSize - 1);
-            list.Add(new Chunk { Start = current, End = end });
-            current = end + 1;
+            if (!existingKeys.Contains(current))
+            {
+                long end = Math.Min(current + _blockSizeBytes - 1, _totalFileSize - 1);
+                queue.Enqueue(new Chunk { Start = current, End = end });
+            }
+            current += _blockSizeBytes;
         }
-        return list;
+        return queue;
     }
 
     private static void UpdateUI(long currentNetworkBytes, DateTime lastActivityTime)
@@ -491,15 +519,14 @@ public class RobustDownloader
     private class DownloadManager
     {
         private string _url;
-        private List<Chunk> _chunks;
         private int _threadCount;
         private CancellationTokenSource _cts;
         private HttpClient _client;
+        private volatile bool _isRestarting = false; // 标记是否正在重启中
 
-        public DownloadManager(string url, List<Chunk> chunks, int threadCount)
+        public DownloadManager(string url, int threadCount)
         {
             _url = url;
-            _chunks = chunks;
             _threadCount = threadCount;
             _cts = new CancellationTokenSource();
             _client = CreateHttpClient();
@@ -510,66 +537,107 @@ public class RobustDownloader
             var handler = new SocketsHttpHandler
             {
                 PooledConnectionLifetime = TimeSpan.FromMinutes(2),
-                MaxConnectionsPerServer = _threadCount + 2
+                MaxConnectionsPerServer = _threadCount + 10 // 稍微给多一点，防止重启时连接池溢出
             };
             return new HttpClient(handler) { Timeout = TimeSpan.FromHours(24) };
         }
 
         public async Task StartAsync()
         {
-            while (_nextWriteOffset < _totalFileSize)
+            // 只要磁盘没写完，就一直循环（大循环负责处理重启）
+            while (_totalBytesWritten < _totalFileSize)
             {
-                List<Chunk> remainingChunks;
-                lock (_chunks)
+                _isRestarting = false;
+                
+                // 1. 根据当前的写入进度重新生成队列
+                var chunksQueue = GenerateChunksQueue(_nextWriteOffset);
+
+                // 如果队列为空，说明剩余的块都已经下载在 buffer 里了，只是还没写入硬盘。
+                // 此时不需要启动下载任务，只需要等待 WriterLoop 工作。
+                if (chunksQueue.IsEmpty)
                 {
-                    remainingChunks = _chunks.Where(c => c.End >= _nextWriteOffset).ToList();
+                    await Task.Delay(500); // 挂起 500ms，把 CPU 让给 WriterLoop
+                    continue; // 跳过本次循环，重新检查 _totalBytesWritten
                 }
 
-                var tasks = new List<Task>();
-                foreach (var chunk in remainingChunks)
-                {
-                    await _bufferSlots.WaitAsync(_cts.Token);
-                    await _downloadSlots.WaitAsync(_cts.Token);
+                var activeTasks = new List<Task>();
 
-                    tasks.Add(Task.Run(async () =>
-                    {
-                        try
-                        {
-                            await DownloadChunkWithRetry(_client, _url, chunk);
-                        }
-                        catch (Exception)
-                        {
-                            lock (_chunks)
-                            {
-                                _chunks.Add(chunk);
-                            }
-                        }
-                        finally
-                        {
-                            _downloadSlots.Release();
-                        }
-                    }, _cts.Token));
-                }
+                PrintColor($"\n[DownloadManager] Starting loop. Chunks remaining: {chunksQueue.Count}", ConsoleColor.DarkGray);
 
                 try
                 {
-                    await Task.WhenAll(tasks);
-                    break; 
+                    while (!chunksQueue.IsEmpty && !_isRestarting)
+                    {
+                        // 2. 严格的信号量管理逻辑，防止死锁
+                        bool acquiredBuffer = false;
+                        bool acquiredThread = false;
+
+                        try
+                        {
+                            await _bufferSlots.WaitAsync(_cts.Token);
+                            acquiredBuffer = true;
+
+                            await _downloadSlots.WaitAsync(_cts.Token);
+                            acquiredThread = true;
+
+                            if (chunksQueue.TryDequeue(out Chunk chunk))
+                            {
+                                activeTasks.Add(Task.Run(async () =>
+                                {
+                                    bool success = false;
+                                    try
+                                    {
+                                        await DownloadChunkWithRetry(_client, _url, chunk, _cts.Token);
+                                        success = true;
+                                    }
+                                    catch (OperationCanceledException) { }
+                                    catch (Exception) { }
+                                    finally
+                                    {
+                                        _downloadSlots.Release();
+                                        // 如果下载失败/取消，数据没进 buffer，必须在此释放 buffer 配额
+                                        if (!success) _bufferSlots.Release();
+                                    }
+                                }, _cts.Token));
+                            }
+                            else
+                            {
+                                _downloadSlots.Release();
+                                _bufferSlots.Release();
+                            }
+                        }
+                        catch (OperationCanceledException)
+                        {
+                            if (acquiredThread) _downloadSlots.Release();
+                            if (acquiredBuffer) _bufferSlots.Release();
+                            throw;
+                        }
+
+                        activeTasks.RemoveAll(t => t.IsCompleted);
+                    }
+
+                    await Task.WhenAll(activeTasks);
                 }
                 catch (OperationCanceledException)
                 {
+                    PrintColor("\n🔄 DownloadManager is resetting connection pool...", ConsoleColor.Yellow);
+                    try { await Task.WhenAll(activeTasks); } catch { }
                     _cts.Dispose();
                     _cts = new CancellationTokenSource();
                     _client.Dispose();
                     _client = CreateHttpClient();
-                    PrintColor("\n🔄 DownloadManager soft restart executed due to stall.", ConsoleColor.Yellow);
+                    PrintColor("✅ Reset complete. Resuming download...", ConsoleColor.Yellow);
                 }
             }
         }
 
         public void SoftRestart()
         {
-            _cts.Cancel();
+            if (!_isRestarting)
+            {
+                _isRestarting = true;
+                _cts.Cancel(); // 这会触发 StartAsync 内部的 catch (OperationCanceledException)
+            }
         }
     }
 }
