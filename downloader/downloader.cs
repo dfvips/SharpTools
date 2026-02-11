@@ -33,6 +33,9 @@ public class RobustDownloader
     
     // 用于 UI 显示当前的诊断状态
     private static string _diagStatus = "Initializing...";
+    
+    // Basic Auth header
+    private static string _basicAuthHeader = null;
 
     // 服务器元数据
     private static DateTime? _serverLastModifiedUtc = null;
@@ -65,7 +68,17 @@ public class RobustDownloader
             return;
         }
 
-        string url = args[0];
+        string rawUrl = args[0];
+        var uri = new Uri(rawUrl);
+
+        string url = uri.GetLeftPart(UriPartial.Path);
+
+        if (!string.IsNullOrEmpty(uri.UserInfo))
+        {
+            var encoded = Convert.ToBase64String(
+                System.Text.Encoding.UTF8.GetBytes(uri.UserInfo));
+            _basicAuthHeader = $"Basic {encoded}";
+        }
         _savePath = args[1];
         _downloadingPath = _savePath + ".downloading";
         _configPath = _savePath + ".cfg";
@@ -94,10 +107,23 @@ public class RobustDownloader
         };
         var httpClient = new HttpClient(socketsHandler) { Timeout = TimeSpan.FromHours(24) };
         httpClient.DefaultRequestHeaders.UserAgent.ParseAdd("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36");
+        
+        if (_basicAuthHeader != null)
+        {
+            httpClient.DefaultRequestHeaders.Authorization =
+                new System.Net.Http.Headers.AuthenticationHeaderValue(
+                    "Basic",
+                    _basicAuthHeader.Substring(6));
+        }
 
         try
         {
-            Console.Clear();
+            // 只有在未重定向输出(有真实控制台窗口)时才清屏
+            if (!Console.IsOutputRedirected)
+            {
+                try { Console.Clear(); } catch { }
+            }
+            
             LogToConsole("=== Robust Downloader v4.8 (Surgical Mode) ===", ConsoleColor.Cyan);
             Console.WriteLine($"URL: {url}");
             Console.WriteLine($"Out: {_savePath}\n");
@@ -610,10 +636,18 @@ public class RobustDownloader
 
         // 使用 padding 覆盖可能残留的旧字符
         string output = $"\r{bar} {progressPct:P1} | {FormatSize(_totalBytesWritten)} | {speedStr} | ETA: {etaStr}{extraInfo}";
-        int padding = Console.WindowWidth - output.Length - 1;
-        if (padding > 0) output += new string(' ', padding);
         
-        Console.Write(output);
+        // 如果输出重定向了，就不要计算 padding，因为 WindowWidth 不可用
+        if (Console.IsOutputRedirected)
+        {
+            Console.Write(output);
+        }
+        else
+        {
+            int padding = Console.WindowWidth - output.Length - 1;
+            if (padding > 0) output += new string(' ', padding);
+            Console.Write(output);
+        }
     }
 
     /// <summary>
@@ -621,6 +655,13 @@ public class RobustDownloader
     /// </summary>
     private static void LogToConsole(string msg, ConsoleColor color)
     {
+        // 如果输出被重定向，直接WriteLine，不操作光标和颜色
+        if (Console.IsOutputRedirected)
+        {
+            Console.WriteLine(msg);
+            return;
+        }
+
         // 先清除当前行
         Console.Write("\r" + new string(' ', Console.WindowWidth - 1) + "\r");
         var prev = Console.ForegroundColor;
@@ -668,7 +709,18 @@ public class RobustDownloader
                 MaxConnectionsPerServer = _threadCount + 20,
                 ConnectTimeout = TimeSpan.FromSeconds(10)
             };
-            return new HttpClient(handler) { Timeout = TimeSpan.FromHours(24) };
+
+            var client = new HttpClient(handler) { Timeout = TimeSpan.FromHours(24) };
+
+            if (RobustDownloader._basicAuthHeader != null)
+            {
+                client.DefaultRequestHeaders.Authorization =
+                    new System.Net.Http.Headers.AuthenticationHeaderValue(
+                        "Basic",
+                        RobustDownloader._basicAuthHeader.Substring(6));
+            }
+
+            return client;
         }
 
         public async Task StartAsync()
