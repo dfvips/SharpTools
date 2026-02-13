@@ -237,7 +237,7 @@ public class RobustDownloader
             {
                 string crcFileName = _savePath + ".crc64";
                 string fileName = Path.GetFileName(_savePath);
-                string content = $"{fileName}===={crcValue}";
+                string content = $"{crcValue} *{fileName}";
                 if (!File.Exists(crcFileName) || File.ReadAllText(crcFileName) != content)
                 {
                     await File.WriteAllTextAsync(crcFileName, content);
