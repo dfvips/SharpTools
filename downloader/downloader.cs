@@ -36,6 +36,7 @@ public class RobustDownloader
     
     // Basic Auth header
     private static string _basicAuthHeader = null;
+    private static List<KeyValuePair<string, string>> _customHeaders = new List<KeyValuePair<string, string>>();
 
     // 服务器元数据
     private static DateTime? _serverLastModifiedUtc = null;
@@ -64,7 +65,7 @@ public class RobustDownloader
 
         if (args.Length < 4)
         {
-            LogToConsole("Usage: downloader \"url\" \"save_path\" thread_count block_mb [--crc-only]", ConsoleColor.Yellow);
+            LogToConsole("Usage: downloader \"url\" \"save_path\" thread_count block_mb [--crc-only] [--header \"k:v\"]...", ConsoleColor.Yellow);
             return;
         }
 
@@ -86,6 +87,7 @@ public class RobustDownloader
         double blockSizeMb = double.Parse(args[3]);
 
         bool crcOnly = args.Any(a => a.Equals("--crc-only", StringComparison.OrdinalIgnoreCase));
+        _customHeaders = ParseCustomHeaders(args);
 
         if (!crcOnly && File.Exists(_savePath))
         {
@@ -107,6 +109,7 @@ public class RobustDownloader
         };
         var httpClient = new HttpClient(socketsHandler) { Timeout = TimeSpan.FromHours(24) };
         httpClient.DefaultRequestHeaders.UserAgent.ParseAdd("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36");
+        ApplyCustomHeaders(httpClient);
         
         if (_basicAuthHeader != null)
         {
@@ -679,6 +682,61 @@ public class RobustDownloader
         return $"{len:0.00} {sizes[order]}";
     }
 
+    private static List<KeyValuePair<string, string>> ParseCustomHeaders(string[] args)
+    {
+        var headers = new List<KeyValuePair<string, string>>();
+        for (int i = 4; i < args.Length; i++)
+        {
+            var arg = args[i];
+            if (arg.Equals("--header", StringComparison.OrdinalIgnoreCase))
+            {
+                if (i + 1 < args.Length)
+                {
+                    AddHeaderValue(headers, args[++i]);
+                }
+                continue;
+            }
+            if (arg.StartsWith("--header=", StringComparison.OrdinalIgnoreCase))
+            {
+                AddHeaderValue(headers, arg.Substring("--header=".Length));
+            }
+        }
+        return headers;
+    }
+
+    private static void AddHeaderValue(List<KeyValuePair<string, string>> headers, string value)
+    {
+        if (string.IsNullOrWhiteSpace(value)) return;
+        int idx = value.IndexOf(':');
+        if (idx <= 0) return;
+        string name = value.Substring(0, idx).Trim();
+        string headerValue = value.Substring(idx + 1).Trim();
+        if (string.IsNullOrEmpty(name)) return;
+        headers.Add(new KeyValuePair<string, string>(name, headerValue));
+    }
+
+    private static void ApplyCustomHeaders(HttpClient client)
+    {
+        if (_customHeaders == null || _customHeaders.Count == 0) return;
+        foreach (var header in _customHeaders)
+        {
+            if (string.Equals(header.Key, "User-Agent", StringComparison.OrdinalIgnoreCase))
+            {
+                client.DefaultRequestHeaders.UserAgent.Clear();
+                if (!string.IsNullOrWhiteSpace(header.Value))
+                {
+                    client.DefaultRequestHeaders.UserAgent.ParseAdd(header.Value);
+                }
+                continue;
+            }
+            if (client.DefaultRequestHeaders.Contains(header.Key))
+            {
+                client.DefaultRequestHeaders.Remove(header.Key);
+            }
+            client.DefaultRequestHeaders.TryAddWithoutValidation(header.Key, header.Value);
+        }
+    }
+
     private struct Chunk { public long Start; public long End; }
 
     // ======================================
@@ -719,6 +777,7 @@ public class RobustDownloader
                         "Basic",
                         RobustDownloader._basicAuthHeader.Substring(6));
             }
+            ApplyCustomHeaders(client);
 
             return client;
         }
