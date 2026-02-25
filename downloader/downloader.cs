@@ -65,7 +65,7 @@ public class RobustDownloader
 
         if (args.Length < 4)
         {
-            LogToConsole("Usage: downloader \"url\" \"save_path\" thread_count block_mb [--crc-only] [--header \"k:v\"]...", ConsoleColor.Yellow);
+            LogToConsole("Usage: downloader \"url\" \"save_path\" thread_count block_mb [--crc-only] [--skip-crc] [--header \"k:v\"]...", ConsoleColor.Yellow);
             return;
         }
 
@@ -87,7 +87,14 @@ public class RobustDownloader
         double blockSizeMb = double.Parse(args[3]);
 
         bool crcOnly = args.Any(a => a.Equals("--crc-only", StringComparison.OrdinalIgnoreCase));
+        bool skipCrc = args.Any(a => a.Equals("--skip-crc", StringComparison.OrdinalIgnoreCase));
         _customHeaders = ParseCustomHeaders(args);
+
+        if (crcOnly && skipCrc)
+        {
+            LogToConsole("Error: --crc-only cannot be used with --skip-crc.", ConsoleColor.Red);
+            return;
+        }
 
         if (!crcOnly && File.Exists(_savePath))
         {
@@ -132,7 +139,7 @@ public class RobustDownloader
             Console.WriteLine($"Out: {_savePath}\n");
 
             // 初始化连接并获取元数据
-            bool supportsRange = await InitializeDownloadAsync(httpClient, url, crcOnly);
+            bool supportsRange = await InitializeDownloadAsync(httpClient, url, crcOnly, skipCrc);
 
             if (crcOnly)
             {
@@ -214,7 +221,7 @@ public class RobustDownloader
     // 辅助方法 (Helper Methods)
     // ======================================
 
-    private static async Task<bool> InitializeDownloadAsync(HttpClient client, string url, bool crcOnly = false)
+    private static async Task<bool> InitializeDownloadAsync(HttpClient client, string url, bool crcOnly = false, bool skipCrc = false)
     {
         Console.WriteLine("--- Connecting to server... ---");
         var request = new HttpRequestMessage(HttpMethod.Get, url);
@@ -233,7 +240,7 @@ public class RobustDownloader
             _serverLastModifiedUtc = response.Content.Headers.LastModified.Value.UtcDateTime;
 
         // 尝试提取 CRC64
-        if (response.Headers.TryGetValues("x-cos-hash-crc64ecma", out var crcValues))
+        if (!skipCrc && response.Headers.TryGetValues("x-cos-hash-crc64ecma", out var crcValues))
         {
             string crcValue = crcValues.FirstOrDefault();
             if (!string.IsNullOrEmpty(crcValue))
