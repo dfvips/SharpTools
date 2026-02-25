@@ -75,7 +75,7 @@ class Program
         ulong crc = Crc64Ecma.Compute(fs, p => DrawProgress(p, file));
 
         Console.WriteLine();
-        WriteColored($"{NameOnly(file)}===={crc}", ConsoleColor.Green);
+        WriteColored($"{crc} *{NameOnly(file)}", ConsoleColor.Green);
     }
 
     // ================= crc64 文件校验 =================
@@ -99,12 +99,27 @@ class Program
             if (string.IsNullOrWhiteSpace(line))
                 continue;
 
-            var parts = line.Split("====", StringSplitOptions.RemoveEmptyEntries);
-            if (parts.Length != 2)
-                continue;
+            string file;
+            ulong expected;
 
-            string file = parts[0];
-            ulong expected = ulong.Parse(parts[1]);
+            var legacyParts = line.Split("====", StringSplitOptions.RemoveEmptyEntries);
+            if (legacyParts.Length == 2)
+            {
+                file = legacyParts[0].Trim();
+                expected = ulong.Parse(legacyParts[1].Trim());
+            }
+            else
+            {
+                int spaceIdx = line.IndexOf(' ');
+                if (spaceIdx <= 0) continue;
+
+                string num = line.Substring(0, spaceIdx).Trim();
+                string name = line.Substring(spaceIdx + 1).Trim();
+                if (name.StartsWith("*")) name = name.Substring(1).Trim();
+
+                expected = ulong.Parse(num);
+                file = name;
+            }
 
             if (!File.Exists(file))
             {
